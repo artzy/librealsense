@@ -24,7 +24,7 @@ endif()
 list(APPEND DEPENDENCIES ${OPENGL_LIBRARIES})
 
 if(WIN32)
-    list(APPEND DEPENDENCIES glfw3)
+    # glfw is linked explicitly in pcl/CMakeLists.txt via the glfw target.
 else()
     find_package(glfw3 REQUIRED)
     list(APPEND DEPENDENCIES glfw)

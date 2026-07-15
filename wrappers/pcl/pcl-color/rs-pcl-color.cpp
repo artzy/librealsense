@@ -17,6 +17,8 @@
 
 #include <iostream>
 #include <algorithm> 
+#include <chrono>
+#include <thread>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/thread.hpp>
 #include <string>
@@ -187,7 +189,7 @@ int main() try
         // Query min and max values:
         auto range = depth_sensor.get_option_range(RS2_OPTION_LASER_POWER);
         depth_sensor.set_option(RS2_OPTION_LASER_POWER, range.max); // Set max power
-        sleep(1);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         depth_sensor.set_option(RS2_OPTION_LASER_POWER, 0.f); // Disable laser
     }
 
