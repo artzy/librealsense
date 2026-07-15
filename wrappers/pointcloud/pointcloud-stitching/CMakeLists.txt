@@ -15,11 +15,21 @@ if(NOT OPENGL_FOUND)
 endif()
 
 list(APPEND DEPENDENCIES ${OPENGL_LIBRARIES})
-list(APPEND DEPENDENCIES glfw)
+if(NOT WIN32)
+    list(APPEND DEPENDENCIES glfw)
+endif()
 
 add_executable(rs-pointcloud-stitching rs-pointcloud-stitching.cpp rs-pointcloud-stitching.h ../../../examples/example.hpp ${IMGUI_SOURCE})
 set_property(TARGET rs-pointcloud-stitching PROPERTY CXX_STANDARD 11)
-target_link_libraries( rs-pointcloud-stitching ${DEPENDENCIES} tclap )
+target_link_libraries( rs-pointcloud-stitching PRIVATE ${DEPENDENCIES} tclap )
+
+if(MSVC AND CMAKE_PREFIX_PATH MATCHES "vcpkg")
+    target_include_directories(rs-pointcloud-stitching PUBLIC "${CMAKE_SOURCE_DIR}/third-party/glfw/include")
+elseif(MSVC)
+    target_link_libraries(rs-pointcloud-stitching PRIVATE "${CMAKE_BINARY_DIR}/$<CONFIG>/glfw3.lib")
+    target_include_directories(rs-pointcloud-stitching PUBLIC "${CMAKE_SOURCE_DIR}/third-party/glfw/include")
+endif()
+
 include_directories(./ ../../../examples ../../../third-party/ ../../../third-party/imgui ../../../third-party/glfw/include ../../../common/res)
 set_target_properties (rs-pointcloud-stitching PROPERTIES FOLDER "Examples")
 install(TARGETS rs-pointcloud-stitching RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

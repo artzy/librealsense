@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
     if (flag_play) {
       std::this_thread::sleep_until(last_frame_time + frame_interval);
       last_frame_time = std::chrono::steady_clock::now();
-      im_rgbd = bag_reader.NextFrame().ToLegacyRGBDImage();
+      im_rgbd = bag_reader.NextFrame().ToLegacy();
       // create shared_ptr with no-op deleter for stack RGBDImage
       auto ptr_im_rgbd =
           std::shared_ptr<legacyRGBDImage>(&im_rgbd, [](legacyRGBDImage *) {});

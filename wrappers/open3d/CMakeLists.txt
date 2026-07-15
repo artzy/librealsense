@@ -20,13 +20,16 @@ endif()
 project(Open3D_RS_examples LANGUAGES CXX)
 
 # Find installed Open3D, which exports Open3D::Open3D
+if(NOT OPEN3D_INSTALL_DIR)
+    set(OPEN3D_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}" CACHE PATH "Open3D install prefix")
+endif()
 if(WIN32)
-    find_package(Open3D HINTS ${CMAKE_INSTALL_PREFIX}/CMake)
+    find_package(Open3D HINTS ${OPEN3D_INSTALL_DIR}/CMake)
 else()
-    find_package(Open3D HINTS ${CMAKE_INSTALL_PREFIX}/lib/cmake)
+    find_package(Open3D HINTS ${OPEN3D_INSTALL_DIR}/lib/cmake)
 endif()
 if(NOT Open3D_FOUND OR Open3D_VERSION VERSION_LESS 0.12)
-    message(FATAL_ERROR "Open3D v0.12+ not found, please use -DCMAKE_INSTALL_PREFIX=open3d_install_dir")
+    message(FATAL_ERROR "Open3D v0.12+ not found, please set -DOPEN3D_INSTALL_DIR=open3d_install_dir")
 endif()
 
 foreach(EXAMPLE RealSenseBagReader RealSenseRecorder)
@@ -40,7 +43,7 @@ foreach(EXAMPLE RealSenseBagReader RealSenseRecorder)
             message(STATUS "Will copy Open3D.dll to ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>")
             add_custom_command(TARGET ${EXAMPLE} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy
-                ${CMAKE_INSTALL_PREFIX}/bin/Open3D.dll
+                ${OPEN3D_INSTALL_DIR}/bin/Open3D.dll
                 ${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>)
         endif()
     endif()
