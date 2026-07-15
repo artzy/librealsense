@@ -1,5 +1,6 @@
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/core/ocl.hpp>
 #include <opencv2/rgbd/kinfu.hpp>
 
 #include <librealsense2/rs.hpp> // Include RealSense Cross Platform API
@@ -9,6 +10,8 @@
 #include <queue>
 #include <atomic>
 #include <fstream>
+#include <algorithm>
+#include <cstring>
 
 using namespace cv;
 using namespace cv::kinfu;
@@ -34,72 +37,57 @@ void colorize_pointcloud(const Mat points, Mat& color)
     applyColorMap(color, color, COLORMAP_JET);
 }
 
-// Handles all the OpenGL calls needed to display the point cloud
-void draw_kinfu_pointcloud(glfw_state& app_state, Mat points, Mat normals)
+#ifndef GL_BGRA
+#define GL_BGRA 0x80E1
+#endif
+
+// getCloud() uses fillPtsNrm OpenCL kernel which fails on many NVIDIA drivers.
+// render() uses the last raycast result and works with OpenCL enabled.
+void draw_kinfu_render(const Mat& rendered, int window_w, int window_h)
 {
-    // Define new matrix which will later hold the coloring of the pointcloud
-    Mat color;
-    colorize_pointcloud(points, color);
-
-    // OpenGL commands that prep screen for the pointcloud
-    glLoadIdentity();
-    glPushAttrib(GL_ALL_ATTRIB_BITS);
-
     glClearColor(153.f / 255, 153.f / 255, 153.f / 255, 1);
-    glClear(GL_DEPTH_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (rendered.empty())
+        return;
+
+    const float scale = std::min(float(window_w) / rendered.cols, float(window_h) / rendered.rows);
+    const int draw_w = int(rendered.cols * scale);
+    const int draw_h = int(rendered.rows * scale);
+    const int draw_x = (window_w - draw_w) / 2;
+    const int draw_y = (window_h - draw_h) / 2;
 
     glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    gluPerspective(65, 1.3, 0.01f, 10.0f);
-
+    glLoadIdentity();
+    glOrtho(0, window_w, window_h, 0, -1, 1);
     glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    gluLookAt(0, 0, 0, 0, 0, 1, 0, -1, 0);
+    glLoadIdentity();
 
-    glTranslatef(0, 0, 1 + app_state.offset_y*0.05f);
-    glRotated(app_state.pitch-20, 1, 0, 0);
-    glRotated(app_state.yaw+5, 0, 1, 0);
-    glTranslatef(0, 0, -0.5f);
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rendered.cols, rendered.rows, 0, GL_BGRA, GL_UNSIGNED_BYTE, rendered.data);
 
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_COLOR_MATERIAL);
-    glEnable(GL_LIGHTING);
-    glEnable(GL_LIGHT0);
-    glBegin(GL_POINTS);
-    // this segment actually prints the pointcloud
-    for (int i = 0; i < points.rows; i++)
-    {
-        // Get point coordinates from 'points' matrix
-        float x = points.at<float>(i, 0);
-        float y = points.at<float>(i, 1);
-        float z = points.at<float>(i, 2);
-
-        // Get point coordinates from 'normals' matrix
-        float nx = normals.at<float>(i, 0);
-        float ny = normals.at<float>(i, 1);
-        float nz = normals.at<float>(i, 2);
-
-        // Get the r, g, b values for the current point
-        uchar r = color.at<uchar>(i, 0);
-        uchar g = color.at<uchar>(i, 1);
-        uchar b = color.at<uchar>(i, 2);
-
-        // Register color and coordinates of the current point
-        glColor3ub(r, g, b);
-        glNormal3f(nx, ny, nz);
-        glVertex3f(x, y, z);
-    }
-    // OpenGL cleanup
+    glEnable(GL_TEXTURE_2D);
+    glColor3f(1.f, 1.f, 1.f);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2i(draw_x, draw_y);
+    glTexCoord2f(1, 0); glVertex2i(draw_x + draw_w, draw_y);
+    glTexCoord2f(1, 1); glVertex2i(draw_x + draw_w, draw_y + draw_h);
+    glTexCoord2f(0, 1); glVertex2i(draw_x, draw_y + draw_h);
     glEnd();
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-    glPopAttrib();
+    glDisable(GL_TEXTURE_2D);
+    glDeleteTextures(1, &tex);
 }
+
 
 
 void export_to_ply(Mat points, Mat normals)
 {
+    if (points.empty())
+        return;
     // First generate a filename
     const size_t buffer_size = 50;
     char fname[buffer_size];
@@ -187,7 +175,8 @@ int main(int argc, char **argv)
     rs2::pipeline p;
     rs2::config cfg;
     float depth_scale;
-    cfg.enable_stream(RS2_STREAM_DEPTH, 1280, 720, RS2_FORMAT_Z16);
+    // 640x480 is closer to KinFu defaults and more stable than 1280x720 for ICP
+    cfg.enable_stream(RS2_STREAM_DEPTH, 640, 480, RS2_FORMAT_Z16);
     auto profile = p.start(cfg);
     auto dev = profile.get_device();
     auto stream_depth = profile.get_stream(RS2_STREAM_DEPTH);
@@ -200,8 +189,8 @@ int main(int argc, char **argv)
     {
         if (rs2::depth_sensor dpt = sensor.as<rs2::depth_sensor>())
         {
-            // Set some presets for better results
-            dpt.set_option(RS2_OPTION_VISUAL_PRESET, RS2_RS400_VISUAL_PRESET_HIGH_DENSITY);
+            // DEFAULT preset: less noise than HIGH_DENSITY, better ICP stability
+            dpt.set_option(RS2_OPTION_VISUAL_PRESET, RS2_RS400_VISUAL_PRESET_DEFAULT);
             // Depth scale is needed for the kinfu set-up
             depth_scale = dpt.get_depth_scale();
             break;
@@ -210,10 +199,16 @@ int main(int argc, char **argv)
 
     // Declare post-processing filters for better results
     auto decimation = rs2::decimation_filter();
+    decimation.set_option(RS2_OPTION_FILTER_MAGNITUDE, 2);
     auto spatial = rs2::spatial_filter();
     auto temporal = rs2::temporal_filter();
 
     auto clipping_dist = max_dist / depth_scale; // convert clipping_dist to raw depth units
+
+    auto depth_profile = stream_depth.as<rs2::video_stream_profile>();
+    auto intrin = depth_profile.get_intrinsics();
+    const int raw_w = depth_profile.width();
+    const int raw_h = depth_profile.height();
 
     // Use decimation once to get the final size of the frame
     d = decimation.process(d);
@@ -221,21 +216,36 @@ int main(int argc, char **argv)
     auto h = d.get_height();
     Size size = Size(w, h);
 
-    auto intrin = stream_depth.as<rs2::video_stream_profile>().get_intrinsics();
+    // Scale intrinsics to match decimated depth resolution
+    const float sx = float(w) / raw_w;
+    const float sy = float(h) / raw_h;
 
     // Configure kinfu's parameters
     params->frameSize = size;
-    params->intr = Matx33f(intrin.fx, 0, intrin.ppx,
-                           0, intrin.fy, intrin.ppy,
+    params->intr = Matx33f(intrin.fx * sx, 0, intrin.ppx * sx,
+                           0, intrin.fy * sy, intrin.ppy * sy,
                            0, 0, 1);
     params->depthFactor = 1 / depth_scale;
 
+    // Relax ICP thresholds for RealSense depth noise / hand-held motion
+    params->icpDistThresh = 0.2f;
+    params->icpAngleThresh = float(60. * CV_PI / 180.);
+
+    // OpenCL TSDF works on RTX, but OpenCL ICP (getAb) often fails on NVIDIA and
+    // causes endless reset. CPU KinFu uses Mat-based ICP which is stable.
+    cv::ocl::setUseOpenCL(false);
+    std::cout << "KinFu: CPU path (stable ICP; OpenCL ICP fails on many NVIDIA GPUs)" << std::endl;
+
     // Initialize KinFu object
-    kf = KinFu::create(params);
+    try {
+        kf = KinFu::create(params);
+    } catch (const cv::Exception& e) {
+        std::cerr << "KinFu init failed: " << e.what() << std::endl;
+        return 1;
+    }
 
     bool after_reset = false;
-    mat_queue points_queue;
-    mat_queue normals_queue;
+    mat_queue render_queue;
 
     window app(1280, 720, "RealSense KinectFusion Example");
     glfw_state app_state;
@@ -245,8 +255,9 @@ int main(int argc, char **argv)
 
     // This thread runs KinFu algorithm and calculates the pointcloud by fusing depth data from subsequent depth frames
     std::thread calc_cloud_thread([&]() {
-        Mat _points;
-        Mat _normals;
+        Mat _rendered;
+        int icp_fail_streak = 0;
+        const int reset_after_fails = 30;
         try {
             while (!stopped)
             {
@@ -258,87 +269,69 @@ int main(int argc, char **argv)
                 d = spatial.process(d);
                 d = temporal.process(d);
 
-                // Set depth values higher than clipping_dist to 0, to avoid unnecessary noise in the pointcloud
-                uint16_t* p_depth_frame = reinterpret_cast<uint16_t*>(const_cast<void*>(d.get_data()));
-#pragma omp parallel for schedule(dynamic) //Using OpenMP to try to parallelise the loop
+                // Copy depth to owned buffer, then clip (avoid mutating RealSense filter buffers)
+                Mat f(h, w, CV_16UC1);
+                memcpy(f.data, d.get_data(), size_t(w) * h * sizeof(uint16_t));
+                uint16_t* p_depth_frame = reinterpret_cast<uint16_t*>(f.data);
+#pragma omp parallel for schedule(dynamic)
                 for (int y = 0; y < h; y++)
                 {
                     auto depth_pixel_index = y * w;
                     for (int x = 0; x < w; x++, ++depth_pixel_index)
                     {
-                        // Check if the depth value of the current pixel is greater than the threshold
                         if (p_depth_frame[depth_pixel_index] > clipping_dist)
-                        {
                             p_depth_frame[depth_pixel_index] = 0;
-                        }
                     }
                 }
 
-                // Define matrices on the GPU for KinFu's use
-                UMat points;
-                UMat normals;
-                // Copy frame from CPU to GPU
-                Mat f(h, w, CV_16UC1, (void*)d.get_data());
-                UMat frame(h, w, CV_16UC1);
-                f.copyTo(frame);
-                f.release();
-
-                // Run KinFu on the new frame(on GPU)
-                if (!kf->update(frame))
+                // Run KinFu (CPU Mat path when OpenCL is disabled at create time)
+                if (!kf->update(f))
                 {
-                    kf->reset(); // If the algorithm failed, reset current state
-                    // Save the pointcloud obtained before failure
-                    export_to_ply(_points, _normals);
-
-                    // To avoid calculating pointcloud before new frames were processed, set 'after_reset' to 'true'
-                    after_reset = true;
-                    points.release();
-                    normals.release();
-                    std::cout << "reset" << std::endl;
+                    icp_fail_streak++;
+                    if (icp_fail_streak >= reset_after_fails)
+                    {
+                        kf->reset();
+                        icp_fail_streak = 0;
+                        after_reset = true;
+                        std::cout << "reset (ICP lost for " << reset_after_fails << " frames)" << std::endl;
+                    }
                 }
-
-                // Get current pointcloud
-                if (!after_reset)
+                else
                 {
-                    kf->getCloud(points, normals);
-                }
-
-                if (!points.empty() && !normals.empty())
-                {
-                    // copy points from GPU to CPU for rendering
-                    points.copyTo(_points);
-                    points.release();
-                    normals.copyTo(_normals);
-                    normals.release();
-                    // Push to queue for rendering
-                    points_queue.push(_points);
-                    normals_queue.push(_normals);
+                    icp_fail_streak = 0;
+                    if (!after_reset)
+                    {
+                        try
+                        {
+                            UMat rendered;
+                            kf->render(rendered);
+                            rendered.copyTo(_rendered);
+                            render_queue.push(_rendered);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            std::cerr << "render failed: " << e.what() << std::endl;
+                        }
+                    }
                 }
                 after_reset = false;
             }
         }
-        catch (const std::exception& e) // Save pointcloud in case an error occurs (for example, camera disconnects)
+        catch (const std::exception& e)
         {
-            export_to_ply(_points, _normals);
+            std::cerr << "KinFu worker error: " << e.what() << std::endl;
         }
     });
-    
-    // Main thread handles rendering of the pointcloud
-    Mat points;
-    Mat normals;
+
+    // Main thread handles rendering
+    Mat rendered;
     while (app)
     {
-        // Get the current state of the pointcloud
-        points_queue.try_get_next_item(points);
-        normals_queue.try_get_next_item(normals);
-        if (!points.empty() && !normals.empty()) // points or normals might not be ready on first iterations
-            draw_kinfu_pointcloud(app_state, points, normals);
+        render_queue.try_get_next_item(rendered);
+        draw_kinfu_render(rendered, 1280, 720);
     }
     stopped = true;
     calc_cloud_thread.join();
-
-    // Save the pointcloud upon closing the app
-    export_to_ply(points, normals);
 
     return 0;
 }
