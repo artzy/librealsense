@@ -9,6 +9,97 @@
 #include <imgui_impl_opengl3.h>
 #include<realsense_imgui.h>
 
+#ifdef _WIN32
+#include "metadata-helper.h"
+#endif
+
+namespace {
+
+bool apply_hdr_config(rs2::depth_sensor& depth_sensor)
+{
+    if (!depth_sensor.supports(RS2_OPTION_SEQUENCE_SIZE))
+        return false;
+
+    // Reset HDR so the sub-preset is always pushed to firmware (not skipped as "already enabled")
+    if (depth_sensor.get_option(RS2_OPTION_HDR_ENABLED))
+        depth_sensor.set_option(RS2_OPTION_HDR_ENABLED, 0);
+
+    // disable auto exposure before sending HDR configuration
+    if (depth_sensor.get_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE))
+        depth_sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0);
+
+    // setting the HDR sequence size to 2 frames
+    depth_sensor.set_option(RS2_OPTION_SEQUENCE_SIZE, 2);
+
+    // configuring id for this hdr config (value must be in range [0,3])
+    depth_sensor.set_option(RS2_OPTION_SEQUENCE_NAME, 0);
+
+    // configuration for the first HDR sequence ID
+    depth_sensor.set_option(RS2_OPTION_SEQUENCE_ID, 1);
+    depth_sensor.set_option(RS2_OPTION_EXPOSURE, 8000); // setting exposure to 8000, so sequence 1 will be set to high exposure
+    depth_sensor.set_option(RS2_OPTION_GAIN, 25); // setting gain to 25, so sequence 1 will be set to high gain
+
+    // configuration for the second HDR sequence ID
+    depth_sensor.set_option(RS2_OPTION_SEQUENCE_ID, 2);
+    depth_sensor.set_option(RS2_OPTION_EXPOSURE, 18);  // setting exposure to 18, so sequence 2 will be set to low exposure
+    depth_sensor.set_option(RS2_OPTION_GAIN, 16); // setting gain to 16, so sequence 2 will be set to low gain
+
+    // turning ON the HDR with the above configuration
+    depth_sensor.set_option(RS2_OPTION_HDR_ENABLED, 1);
+
+    return depth_sensor.get_option(RS2_OPTION_HDR_ENABLED) != 0.f;
+}
+
+bool wait_for_hdr_metadata(rs2::pipeline& pipe, int max_frames)
+{
+    for (int i = 0; i < max_frames; ++i)
+    {
+        auto frames = pipe.wait_for_frames();
+        auto depth = frames.get_depth_frame();
+        if (depth.supports_frame_metadata(RS2_FRAME_METADATA_SEQUENCE_SIZE) &&
+            depth.supports_frame_metadata(RS2_FRAME_METADATA_SEQUENCE_ID))
+            return true;
+    }
+    return false;
+}
+
+#ifdef _WIN32
+bool ensure_windows_metadata_enabled(rs2::device& device, rs2::depth_sensor& depth_sensor)
+{
+    if (!device.supports(RS2_CAMERA_INFO_PRODUCT_LINE))
+        return true;
+
+    const auto product_line = device.get_info(RS2_CAMERA_INFO_PRODUCT_LINE);
+    if (!rs2::metadata_helper::can_support_metadata(product_line))
+        return true;
+
+    if (!depth_sensor.supports(RS2_CAMERA_INFO_PHYSICAL_PORT))
+        return true;
+
+    const auto port = depth_sensor.get_info(RS2_CAMERA_INFO_PHYSICAL_PORT);
+    if (rs2::metadata_helper::instance().is_enabled(port))
+        return true;
+
+    std::cout << "Windows per-frame metadata is required for HDR but is not enabled.\n";
+    std::cout << "Attempting to enable metadata (Administrator approval may be required)...\n";
+
+    try
+    {
+        rs2::metadata_helper::instance().enable_metadata();
+    }
+    catch (const std::exception& e)
+    {
+        std::cout << "Failed to enable metadata: " << e.what() << "\n";
+        std::cout << "Run RealSense Viewer as Administrator and enable metadata from the notification, then retry.\n";
+        return false;
+    }
+
+    return rs2::metadata_helper::instance().is_enabled(port);
+}
+#endif
+
+} // namespace
+
 // HDR Example demonstrates how to use the HDR feature - only for D400 product line devices
 int main() try
 {
@@ -42,59 +133,56 @@ int main() try
         return EXIT_SUCCESS;
     }
 
-    rs2::depth_sensor depth_sensor = device.query_sensors().front();
-
-    // disable auto exposure before sending HDR configuration
-    if (depth_sensor.get_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE))
-        depth_sensor.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0);
-
-    // setting the HDR sequence size to 2 frames
-    if (depth_sensor.supports(RS2_OPTION_SEQUENCE_SIZE))
-        depth_sensor.set_option(RS2_OPTION_SEQUENCE_SIZE, 2);
-    else
-    {
-        std::cout << "Firmware and/or SDK versions must be updated for the HDR feature to be supported.\n";
-        return EXIT_SUCCESS;
-    }
-
-    // configuring id for this hdr config (value must be in range [0,3])
-    depth_sensor.set_option(RS2_OPTION_SEQUENCE_NAME, 0);
-
-    // configuration for the first HDR sequence ID
-    depth_sensor.set_option(RS2_OPTION_SEQUENCE_ID, 1);
-    depth_sensor.set_option(RS2_OPTION_EXPOSURE, 8000); // setting exposure to 8000, so sequence 1 will be set to high exposure
-    depth_sensor.set_option(RS2_OPTION_GAIN, 25); // setting gain to 25, so sequence 1 will be set to high gain
-
-    // configuration for the second HDR sequence ID
-    depth_sensor.set_option(RS2_OPTION_SEQUENCE_ID, 2);
-    depth_sensor.set_option(RS2_OPTION_EXPOSURE, 18);  // setting exposure to 18, so sequence 2 will be set to low exposure
-    depth_sensor.set_option(RS2_OPTION_GAIN, 16); // setting gain to 16, so sequence 2 will be set to low gain
-
-    // turning ON the HDR with the above configuration
-    depth_sensor.set_option(RS2_OPTION_HDR_ENABLED, 1);
-
     // Declare depth colorizer for pretty visualization of depth data
     rs2::colorizer color_map;
 
     // Declare RealSense pipeline, encapsulating the actual device and sensors
     rs2::pipeline pipe;
 
-    // Start streaming with depth and infrared configuration
-    // The HDR merging algorithm can work with both depth and infrared,or only with depth,
-    // but the resulting stream is better when both depth and infrared are used.
+    // Start streaming with depth and infrared configuration.
+    // HDR merges two consecutive frames, so use 60 fps input for ~30 fps HDR output.
     rs2::config cfg;
-    cfg.enable_stream(RS2_STREAM_DEPTH);
-    cfg.enable_stream(RS2_STREAM_INFRARED, 1);
-    pipe.start(cfg);
+    cfg.enable_device(device.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER));
+    cfg.enable_stream(RS2_STREAM_DEPTH, 848, 480, RS2_FORMAT_Z16, 60);
+    cfg.enable_stream(RS2_STREAM_INFRARED, 1, 848, 480, RS2_FORMAT_Y8, 60);
+    auto profile = pipe.start(cfg);
+
+    // Configure HDR on the actively streaming depth sensor
+    rs2::depth_sensor depth_sensor = profile.get_device().first<rs2::depth_sensor>();
+    if (!depth_sensor)
+    {
+        std::cout << "No depth sensor detected. Is the device plugged in?\n";
+        return EXIT_SUCCESS;
+    }
+
+#ifdef _WIN32
+    if (!ensure_windows_metadata_enabled(device, depth_sensor))
+        return EXIT_SUCCESS;
+
+    // Metadata registry changes require restarting the streaming session
+    pipe.stop();
+    profile = pipe.start(cfg);
+    depth_sensor = profile.get_device().first<rs2::depth_sensor>();
+#endif
+
+    if (!apply_hdr_config(depth_sensor))
+    {
+        std::cout << "Firmware and/or SDK versions must be updated for the HDR feature to be supported.\n";
+        return EXIT_SUCCESS;
+    }
+
+    if (!wait_for_hdr_metadata(pipe, 120))
+    {
+        std::cout << "HDR is enabled but depth frames do not contain HDR metadata.\n";
+        std::cout << "On Windows, verify that per-frame metadata is enabled for this camera.\n";
+        return EXIT_SUCCESS;
+    }
 
     // initializing the merging filter
     rs2::hdr_merge merging_filter;
 
     // initializing the frameset
     rs2::frameset data;
-
-    // flag used to see the original stream or the merged one
-    int frames_without_hdr_metadata_params = 0;
 
     // init parameters to set view's window
     unsigned width = 1280;
@@ -126,12 +214,6 @@ int main() try
         if (!frame.supports_frame_metadata(RS2_FRAME_METADATA_SEQUENCE_SIZE) ||
             !frame.supports_frame_metadata(RS2_FRAME_METADATA_SEQUENCE_ID))
         {
-            ++frames_without_hdr_metadata_params;
-            if (frames_without_hdr_metadata_params > 20)
-            {
-                std::cout << "Firmware and/or SDK versions must be updated for the HDR feature to be supported.\n";
-                return EXIT_SUCCESS;
-            }
             app.show(data.apply_filter(color_map));
             continue;
         }
