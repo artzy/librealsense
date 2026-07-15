@@ -1,0 +1,15 @@
+#!/bin/sh
+# Strip Cursor attribution trailers from commit messages.
+# Used via: git config core.hooksPath scripts/git-hooks
+
+MSG_FILE="$1"
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+TMP_FILE="${MSG_FILE}.tmp"
+grep -viE '^Co-authored-by:[[:space:]]*Cursor[[:space:]]*<cursoragent@cursor\.com>[[:space:]]*$' "$MSG_FILE" > "$TMP_FILE" || true
+
+if [ -f "$TMP_FILE" ]; then
+    mv "$TMP_FILE" "$MSG_FILE"
+fi
+
+exit 0
